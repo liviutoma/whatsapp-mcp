@@ -6,6 +6,7 @@ import os.path
 import requests
 import json
 import audio
+import allowlist
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
@@ -627,11 +628,17 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
+
+        # Fail-closed gate: nothing leaves without an explicit grant.
+        decision = allowlist.check_send(recipient, "text")
+        if not decision.allowed:
+            return False, decision.reason
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
             "message": message,
+            "capability": "text",
         }
         
         response = requests.post(url, json=payload)
@@ -659,13 +666,25 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
         if not media_path:
             return False, "Media path must be provided"
         
+        # The capability is DERIVED from the payload, not assumed. A .ogg is
+        # delivered as a PTT voice note, so it needs 'audio' even when it arrives
+        # through send_file.
+        capability = allowlist.media_capability(media_path)
+
+        # Gate BEFORE stat: refusing first also stops the agent probing whether an
+        # arbitrary local path exists (the error text would disclose it).
+        decision = allowlist.check_send(recipient, capability, media_path=media_path)
+        if not decision.allowed:
+            return False, decision.reason
+
         if not os.path.isfile(media_path):
             return False, f"Media file not found: {media_path}"
-        
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
-            "media_path": media_path
+            "media_path": media_path,
+            "capability": capability,
         }
         
         response = requests.post(url, json=payload)
@@ -693,6 +712,12 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
         if not media_path:
             return False, "Media path must be provided"
         
+        # Fail-closed gate BEFORE stat or transcoding: an audio message needs the
+        # 'audio' grant, which is distinct from 'file'.
+        decision = allowlist.check_send(recipient, "audio", media_path=media_path)
+        if not decision.allowed:
+            return False, decision.reason
+
         if not os.path.isfile(media_path):
             return False, f"Media file not found: {media_path}"
 
@@ -701,11 +726,12 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
                 media_path = audio.convert_to_opus_ogg_temp(media_path)
             except Exception as e:
                 return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
-        
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
-            "media_path": media_path
+            "media_path": media_path,
+            "capability": "audio",
         }
         
         response = requests.post(url, json=payload)

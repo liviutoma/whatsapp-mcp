@@ -200,6 +200,11 @@ type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
 	MediaPath string `json:"media_path,omitempty"`
+	// Capability is the allowlist grant being exercised: text, file or audio.
+	// The MCP server always sets it. If absent it is inferred as text (no media)
+	// or file (media present) — audio is never inferred, so an unlabelled audio
+	// file still needs the 'file' grant.
+	Capability string `json:"capability,omitempty"`
 }
 
 // Function to send a WhatsApp message
@@ -397,8 +402,11 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 
 	// Check for document message
 	if doc := msg.GetDocumentMessage(); doc != nil {
-		filename := doc.GetFileName()
-		if filename == "" {
+		// The filename is attacker-controlled (it comes from the sender). Without
+		// Base() a name like "../../../.ssh/authorized_keys" escapes the store
+		// directory when the download path is built from it.
+		filename := filepath.Base(strings.ReplaceAll(doc.GetFileName(), "\\", "/"))
+		if filename == "" || filename == "." || filename == ".." || filename == "/" {
 			filename = "document_" + time.Now().Format("20060102_150405")
 		}
 		return "document", filename,
@@ -676,18 +684,31 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
-	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+// maxSendBody caps the request body. The API is loopback-only, but without a
+// limit an unauthenticated local process could OOM the bridge with a huge payload.
+const maxSendBody = 1 << 20 // 1 MiB
+
+// sendFunc is the seam between the HTTP surface and whatsmeow. Extracting it lets
+// the gate + handler wiring be tested without a live WhatsApp client — previously
+// deleting the whole gate from this handler left every test green.
+type sendFunc func(recipient, message, mediaPath string) (bool, string)
+
+// handleSend gates and dispatches one send request.
+//
+// The capability is DERIVED from the payload, never taken on trust from the
+// caller: a client-supplied label let `{"capability":"text","media_path":"..."}`
+// pass a text-only grant and upload a file (or, with a .ogg, a voice note).
+func handleSend(send sendFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		// Parse the request body
+		// Parse the request body (bounded)
 		var req SendMessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxSendBody)).Decode(&req); err != nil {
 			http.Error(w, "Invalid request format", http.StatusBadRequest)
 			return
 		}
@@ -698,30 +719,61 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
-		if req.Message == "" && req.MediaPath == "" {
+		mediaPath := strings.Trim(req.MediaPath, " \t\r\n")
+		if req.Message == "" && mediaPath == "" {
 			http.Error(w, "Message or media path is required", http.StatusBadRequest)
 			return
 		}
 
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
+		// ---- fail-closed allowlist gate -------------------------------
+		// Nothing reaches whatsmeow unless the exact recipient JID is listed
+		// with the capability the payload actually exercises.
+		capability := mediaCapability(mediaPath)
+		if declared := strings.ToLower(strings.Trim(req.Capability, " \t\r\n")); declared != "" && declared != capability {
+			// A caller may restate the derived capability, but not contradict it.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: fmt.Sprintf("Declared capability %q does not match the payload, which exercises %q.", declared, capability),
+			})
+			return
+		}
+		decision := checkSendMedia(req.Recipient, capability, mediaPath)
+		if !decision.Allowed {
+			fmt.Printf("Send refused by allowlist: %s\n", decision.Reason)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: decision.Reason,
+			})
+			return
+		}
+		// --------------------------------------------------------------
 
-		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
-		fmt.Println("Message sent", success, message)
-		// Set response headers
+		// Deliberately does not log the message body or media path: both are
+		// user content and this stdout is a terminal/screen-recording leak.
+		fmt.Printf("Sending %s to %s\n", capability, decision.JID)
+
+		success, message := send(req.Recipient, req.Message, mediaPath)
+		fmt.Println("Message sent", success)
 		w.Header().Set("Content-Type", "application/json")
-
-		// Set appropriate status code
 		if !success {
 			w.WriteHeader(http.StatusInternalServerError)
 		}
-
-		// Send response
 		json.NewEncoder(w).Encode(SendMessageResponse{
 			Success: success,
 			Message: message,
 		})
-	})
+	}
+}
+
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	// Handler for sending messages
+	http.HandleFunc("/api/send", handleSend(func(recipient, message, mediaPath string) (bool, string) {
+		return sendWhatsAppMessage(client, recipient, message, mediaPath)
+	}))
 
 	// Handler for downloading media
 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
@@ -774,9 +826,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	// Start the server. Bind to loopback only: this API has no authentication
+	// and can send WhatsApp messages, so exposing it on 0.0.0.0 (the upstream
+	// behaviour) let anything on the LAN message contacts as the user.
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	fmt.Printf("Starting REST API server on %s (loopback only)...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
 	go func() {

@@ -14,12 +14,150 @@ Here's an example of what you can do when it's connected to Claude.
 
 > *Caution:* as with many MCP servers, the WhatsApp MCP is subject to [the lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/). This means that project injection could lead to private data exfiltration.
 
+---
+
+## This fork: fail-closed send allowlist
+
+Upstream lets an agent message **anyone in your contacts**, with no gate, no audit
+trail and no kill switch. This fork adds an explicit allowlist in front of every
+outbound action. Nothing is allowed by default.
+
+Every send is keyed on the **exact WhatsApp JID** and on the **capability** being used
+(`text`, `file`, `audio`). A display name can never authorise a send — names collide and
+are attacker-controlled.
+
+```
+$ python allowlist.py allow 15550100001@s.whatsapp.net --caps text --label Alice
+resolved: 15550100001@s.whatsapp.net  kind=person  label=Alice  caps=text
+
+$ python allowlist.py check 15550100001@s.whatsapp.net --capability file
+Refused: Alice may receive [text] but not 'file'.
+To permit this, run: python allowlist.py allow 15550100001@s.whatsapp.net --caps file
+```
+
+### Safety properties
+
+- **Default deny.** A missing, empty, unreadable, corrupt or wrong-version allowlist
+  refuses **every** send.
+- **Per-capability grants.** `text`, `file` and `audio` are granted independently, so a
+  contact can be reachable by text while attachments stay blocked.
+- **The capability is derived from the payload, never taken on trust.** A `text` grant
+  cannot carry a file, and a `file` grant cannot carry a `.ogg` — which the bridge would
+  deliver as a PTT voice note. Both gates compute it with the same rule
+  (`media_capability` / `mediaCapability`); a caller may restate it but not contradict it.
+- **The gate's own state is unsendable.** A media path inside the allowlist directory is
+  refused, so `send_file` cannot exfiltrate the allowlist or the audit log.
+- **Exact-JID matching.** Bare phone numbers are normalised (`+1 555 010 0001` →
+  `15550100001@s.whatsapp.net`), device suffixes (`user:12@…`) are stripped so they
+  cannot dodge an entry, and `@c.us` folds into `@s.whatsapp.net`.
+- **Duplicates narrow, never widen.** Two entries for one JID intersect.
+- **Unknown capability names grant nothing** (fail closed, not open).
+- **Enforced twice.** In the Python MCP server *and* in the Go bridge, because the bridge
+  is a plain HTTP API anything local can call.
+- **Revocation is immediate.** The file is re-read on every send; nothing is cached.
+- **Corrupt files are never silently overwritten** — `allow` refuses until you fix or
+  delete it by hand.
+- **Refusals tell you how to fix them**, printing the exact command to copy-paste.
+
+### Additional hardening in this fork
+
+- **The bridge binds to `127.0.0.1` only.** Upstream bound `:8080` (`0.0.0.0`), meaning
+  any host on your LAN could POST `/api/send` and message your contacts as you. This was a
+  real remote-send hole; it is closed here.
+- **Audit log.** Every attempt, allowed or refused, is appended to
+  `~/.config/whatsapp-mcp/send-audit.jsonl` as JSONL (`ts`, `source`, `requested`, `jid`,
+  `label`, `capability`, `decision`, `allowed`, `media_path`, `reason`). The file is
+  `0600` inside a `0700` directory because it contains raw recipients, and `source`
+  distinguishes an MCP-layer record from a bridge-layer one. Audit failures never change
+  a decision.
+- **Kill switch.** `WHATSAPP_MCP_SEND_DISABLED=1` refuses everything regardless of the
+  allowlist. This is **per-process**: the MCP server and the bridge each read their own
+  environment, so set it for both if you want both stopped.
+- **Dry-run.** `WHATSAPP_MCP_SEND_DRY_RUN=1` resolves and reports the would-be target and
+  sends nothing.
+
+### Managing the allowlist
+
+```
+python allowlist.py path                        # which file is in effect
+python allowlist.py list [--json]               # what may be sent to
+python allowlist.py allow <jid|phone|name> --caps text,file,audio --label "..."
+python allowlist.py unallow <jid|label>          # works offline
+python allowlist.py check <recipient> --capability text
+```
+
+`allow` resolves a chat *name* against the local `messages.db` as a convenience, but
+refuses on ambiguity and prints the exact JID commands to re-run. `unallow` resolves
+against the stored entries first, so revocation works with the database absent.
+
+Exit codes: `0` ok · `1` invalid `--caps` value · `2` usage error, ambiguous match, or
+not found · `3` refused (`check` also reports an unusable allowlist as `3`) · `4`
+allowlist unusable (`list` / `allow` / `unallow`).
+
+### Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `WHATSAPP_MCP_ALLOWLIST` | `~/.config/whatsapp-mcp/send-allowlist.json` | allowlist path |
+| `WHATSAPP_MCP_AUDIT_LOG` | `~/.config/whatsapp-mcp/send-audit.jsonl` | audit path |
+| `WHATSAPP_MCP_SEND_DISABLED` | unset | `1` blocks all sends |
+| `WHATSAPP_MCP_SEND_DRY_RUN` | unset | `1` reports without sending |
+
+Allowlist format (`version: 1`):
+
+```json
+{
+  "version": 1,
+  "updated": "2026-11-12T00:00:00+00:00",
+  "entries": [
+    { "jid": "15550100001@s.whatsapp.net", "label": "Alice",
+      "allow": ["text"], "added": "2026-11-12T00:00:00+00:00" },
+    { "jid": "120363000000000000@g.us", "label": "Test Group",
+      "allow": ["text"], "added": "2026-11-12T00:00:00+00:00" }
+  ]
+}
+```
+
+### Tests
+
+```
+cd whatsapp-mcp-server && uv run --with pytest --python 3.12 \
+    python -m pytest test_allowlist.py test_send_paths.py -q    # 91 tests
+cd whatsapp-bridge   && go test ./...                           # 38 tests
+```
+
+`test_allowlist.py` covers the decision function: normalisation, every fail-closed branch,
+capability separation, duplicate-narrowing, kill switch, dry-run and audit behaviour.
+`test_send_paths.py` covers the *wiring* — it monkeypatches `requests.post` and asserts
+that a refusal means no HTTP call at all, and that an allowed send carries the derived
+capability. The Go suite includes `httptest` cases against the real `/api/send` handler.
+Both exist because a review showed the gate could be deleted from a sender while the
+rest of the suite stayed green.
+
+### Known limitations
+
+- **The allowlist constrains *who*, not *what*.** `send_file` will upload any readable
+  path the process can open (the allowlist directory itself is blocked, but nothing else
+  is restricted). A prompt-injected agent holding a `file` grant can therefore send
+  documents it finds on disk. Grant `file` sparingly, and run the bridge as a user that
+  cannot read what you would not send.
+- **Recipient-only matching.** An allowed recipient is allowed *everything* granted to
+  them, with no per-message content policy, size cap, or approval step.
+- No outbound rate limiting (deliberate — it adds state and failure modes; add it if you
+  need it).
+
+> Still true, and still your problem: sending is irreversible and unrecoverable. The
+> allowlist narrows *who* an agent can reach — it cannot stop a message that was allowed
+> from being wrong, so review what you enable.
+
+---
+
 ## Installation
 
 ### Prerequisites
 
 - Go
-- Python 3.6+
+- Python 3.11+
 - Anthropic Claude Desktop app (or Cursor)
 - UV (Python package manager), install with `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - FFmpeg (_optional_) - Only needed for audio messages. If you want to send audio files as playable WhatsApp voice messages, they must be in `.ogg` Opus format. With FFmpeg installed, the MCP server will automatically convert non-Opus audio files. Without FFmpeg, you can still send raw audio files using the `send_file` tool.

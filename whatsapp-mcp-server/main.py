@@ -18,6 +18,19 @@ from whatsapp import (
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
 
+def _send_result(success: bool, status_message: str) -> Dict[str, Any]:
+    """Shape a send result.
+
+    A policy refusal is flagged structurally (`refused: true`) so an agent cannot
+    mistake it for a retryable transport error. Retrying a refusal is harmless but
+    pointless; retrying a failed send may duplicate a message.
+    """
+    result: Dict[str, Any] = {"success": success, "message": status_message}
+    if not success and status_message.startswith("Refused:"):
+        result["refused"] = True
+    return result
+
+
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
     """Search WhatsApp contacts by name or phone number.
@@ -178,10 +191,7 @@ def send_message(
     
     # Call the whatsapp_send_message function with the unified recipient parameter
     success, status_message = whatsapp_send_message(recipient, message)
-    return {
-        "success": success,
-        "message": status_message
-    }
+    return _send_result(success, status_message)
 
 @mcp.tool()
 def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
@@ -198,10 +208,7 @@ def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
     
     # Call the whatsapp_send_file function
     success, status_message = whatsapp_send_file(recipient, media_path)
-    return {
-        "success": success,
-        "message": status_message
-    }
+    return _send_result(success, status_message)
 
 @mcp.tool()
 def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
@@ -216,10 +223,7 @@ def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
         A dictionary containing success status and a status message
     """
     success, status_message = whatsapp_audio_voice_message(recipient, media_path)
-    return {
-        "success": success,
-        "message": status_message
-    }
+    return _send_result(success, status_message)
 
 @mcp.tool()
 def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:

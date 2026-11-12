@@ -1,0 +1,79 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: these jobs only read the repo.
+permissions:
+  contents: read
+
+jobs:
+  gate-python:
+    name: gate + wiring (python)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      # Runs inside the project env (uv.lock) rather than an ad-hoc --no-project
+      # env: the latter resolved mcp to 2.x, where FastMCP was renamed, so the
+      # server would not even import. pyproject now pins mcp<2.
+      - name: Gate and wiring tests
+        working-directory: whatsapp-mcp-server
+        run: uv run --with pytest --python 3.12 python -m pytest test_allowlist.py test_send_paths.py -q
+      - name: Import smoke test
+        working-directory: whatsapp-mcp-server
+        run: uv run --python 3.12 python -c "import allowlist, whatsapp, main; print('imports ok')"
+
+  gate-go:
+    name: gate + handler (go)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: whatsapp-bridge/go.mod
+      - name: Vet
+        working-directory: whatsapp-bridge
+        run: go vet ./...
+      - name: Tests (includes httptest against /api/send)
+        working-directory: whatsapp-bridge
+        run: go test ./... -v
+
+  bridge-builds:
+    name: bridge builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: whatsapp-bridge/go.mod
+      - name: Build
+        working-directory: whatsapp-bridge
+        run: go build -o /dev/null .
+
+  no-secrets:
+    name: no committed secrets or local data
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      # Guards the regression that shipped real phone numbers in this fork's first
+      # commit. Fails on a local checkout path or a committed store/db file.
+      - name: Forbid local paths and state files in the tree
+        run: |
+          set -e
+          if git ls-files | grep -E '(^|/)(store/|.*\.db$|.*\.db-wal$|.*\.db-shm$|.*\.jsonl$|\.env)'; then
+            echo "::error::committed local state or secret-bearing file"
+            exit 1
+          fi
+          if grep -rn --include='*.md' --include='*.py' --include='*.go' -E '/Users/[A-Za-z0-9._-]+|/private/var/folders/' .; then
+            echo "::error::committed an absolute local path"
+            exit 1
+          fi
+          echo "ok"

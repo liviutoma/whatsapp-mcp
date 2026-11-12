@@ -1,3 +1,25 @@
+# Databases and local state
 *.db
+*.db-shm
+*.db-wal
+store/
+
+# Local config / secrets
+.env
+.env.*
 claude_desktop_config.json
-whatsapp.log
+
+# Logs and audit trails (may contain recipients)
+*.log
+*.jsonl
+
+# Build / test artefacts
+__pycache__/
+*.py[oc]
+.pytest_cache/
+*.tmp
+*~
+
+# Editor / OS droppings
+.DS_Store
+*.swp
